@@ -9,7 +9,16 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.api.routes import agent, evaluation, evaluation_interactive, health, incidents, ingestion, search
+from app.api.routes import (
+    agent,
+    alerts,
+    evaluation,
+    evaluation_interactive,
+    health,
+    incidents,
+    ingestion,
+    search,
+)
 from app.core.config import settings
 from app.core.logging import configure_logging
 
@@ -63,6 +72,7 @@ app = FastAPI(
 )
 app.include_router(health.router)
 app.include_router(agent.router)
+app.include_router(alerts.router)
 app.include_router(incidents.router)
 app.include_router(ingestion.router)
 app.include_router(search.router)

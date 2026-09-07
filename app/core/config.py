@@ -154,6 +154,13 @@ class Settings(BaseSettings):
     rate_limit_incidents_per_minute: int = Field(default=100, gt=0)
     rate_limit_ingestion_per_minute: int = Field(default=10, gt=0)
     rate_limit_evaluation_runs_per_minute: int = Field(default=60, gt=0)
+    rate_limit_alerts_per_minute: int = Field(
+        default=20, gt=0,
+        description=(
+            "POST /alerts/webhook triggers a full investigation (3-5 LLM calls), "
+            "same cost class as /agent/investigate, so it shares that default."
+        ),
+    )
 
     # ── Phase 24A: production-only configuration validation ────────────────
     #

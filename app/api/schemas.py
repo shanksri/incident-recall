@@ -175,3 +175,73 @@ class InvestigationResponse(BaseModel):
 
 class GitHubIssueRef(BaseModel):
     url: HttpUrl
+
+
+# ── Phase 25: alert webhook (Prometheus/PagerDuty -> investigation) ────────
+
+
+class AlertWebhookRequest(BaseModel):
+    """Wraps the monitoring provider's own raw payload rather than
+    reshaping it — Prometheus and PagerDuty both send their native JSON
+    unmodified, and forcing that into a bespoke schema would mean
+    maintaining a mapping for every provider at this boundary AND inside
+    ``app.services.alert_normalization``. ``repo_owner``/``repo_name`` are
+    supplied by the caller (this platform has no service-to-repository
+    mapping of its own) and are optional — omit them to skip deployment
+    history and get an investigation with no deployment context.
+    """
+
+    provider_payload: dict[str, Any] = Field(
+        description="The raw webhook body exactly as sent by Prometheus Alertmanager or PagerDuty."
+    )
+    repo_owner: str | None = Field(default=None, max_length=200)
+    repo_name: str | None = Field(default=None, max_length=200)
+    n_hypotheses: int = Field(default=3, ge=1, le=10)
+
+
+class NormalizedAlertSummary(BaseModel):
+    source_type: str
+    alert_name: str
+    severity: str
+    service: str | None
+    summary: str
+    problem_statement: str
+
+
+class DeploymentEventSummary(BaseModel):
+    sha: str
+    short_sha: str
+    author: str | None
+    message: str
+    committed_at: datetime
+    url: str
+
+
+class ProposedActionSummary(BaseModel):
+    action_type: str
+    description: str
+    target: str
+    confidence: float | None
+
+
+class PolicyDecisionSummary(BaseModel):
+    category: str
+    requires_approval: bool
+    auto_executable: bool
+    reason: str
+
+
+class AlertWebhookResponse(BaseModel):
+    """The alert is normalized, an investigation is run against its problem
+    statement, and — only when a repository was supplied and the
+    investigation is not uncertain — a deployment-history lookup and a
+    heuristic action suggestion are attached, each passed through the
+    execution policy engine. ``suggested_action``/``policy_decision`` are
+    null whenever the investigation abstained: there is nothing to act on.
+    """
+
+    alert: NormalizedAlertSummary
+    investigation: InvestigationResponse
+    deployment_context: list[DeploymentEventSummary]
+    suggested_action: ProposedActionSummary | None
+    policy_decision: PolicyDecisionSummary | None

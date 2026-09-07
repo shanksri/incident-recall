@@ -221,6 +221,7 @@ interactive_evaluation_rate_limit = _group_dependency(
 )
 incidents_rate_limit = _group_dependency("incidents", lambda: settings.rate_limit_incidents_per_minute)
 ingestion_rate_limit = _group_dependency("ingestion", lambda: settings.rate_limit_ingestion_per_minute)
+alerts_rate_limit = _group_dependency("alerts", lambda: settings.rate_limit_alerts_per_minute)
 
 # Documented, reusable OpenAPI fragment for the 429 response — attached to
 # every rate-limited router via `APIRouter(responses=RATE_LIMIT_RESPONSES)`

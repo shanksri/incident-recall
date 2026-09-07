@@ -26,7 +26,7 @@ grounding metrics. The interesting results are the negative ones:
   (a targeted LLM relevance check) measures well but **is not shipped**, because one promising run
   isn't a validated signal — see [Evaluation findings](#evaluation-findings).
 
-24 phases of incremental, tested development (1,508 tests), plus two production-hardening passes.
+25 phases of incremental, tested development (1,606 tests), plus two production-hardening passes.
 See [Project status](#project-status) for what's done, what's open, and what's deliberately not
 claimed.
 
@@ -106,7 +106,7 @@ incident-management export is a new collector and normalizer with nothing downst
 ## Tech stack
 
 FastAPI · SQLAlchemy 2 + Alembic · PostgreSQL + pgvector + `pg_trgm` · SentenceTransformers ·
-OpenAI API · Docker / docker-compose · pytest (1,508 tests) · Python 3.12
+OpenAI API · Gemini API · MCP · Docker / docker-compose · pytest (1,606 tests) · Python 3.12
 
 ## Documentation map
 
@@ -122,18 +122,20 @@ inline in the code it touches.)
 
 ```
 app/
-  api/routes/       FastAPI routers: health, incidents, ingestion, search, agent, evaluation(+interactive)
+  api/routes/       FastAPI routers: health, incidents, ingestion, search, agent, alerts, evaluation(+interactive)
   api/schemas.py     Pydantic request/response models (validated: length/format/UUID bounds)
   api/validation.py  Shared identifier/UUID validators (Phase 23)
   core/              Settings (pydantic-settings) and logging configuration
   db/                SQLAlchemy models + session management
   ingestion/         Source collectors (GitHub, Jira) and normalization
-  services/          Embedding, LLM, relevance scoring, retrieval (dense/BM25/hybrid/routed), the 4 investigation agents
+  services/          Embedding, LLM, relevance scoring, retrieval (dense/BM25/hybrid/routed), the 4 investigation
+                     agents, alert normalization, deployment history, execution policy engine
   evaluation/        Gold datasets, harnesses, metrics, judges, experiment tracking, diagnostics, judge backends — 39 modules
+  mcp/               MCP server (Phase 25) exposing investigate/search/policy/deployment-history as tools
 alembic/             Database migrations (creates the `vector` and `pg_trgm` extensions)
 docs/                Full architecture documentation (23 numbered docs + index)
 scripts/             Benchmark/evaluation CLI scripts, load_test.py, profile_performance.py
-tests/               1,508 tests: tests/unit, tests/api, tests/eval
+tests/               1,606 tests: tests/unit, tests/api, tests/eval
 Dockerfile, docker-compose.yml   Multi-stage build, non-root user, healthcheck (Phase 23)
 ```
 
@@ -195,6 +197,7 @@ All settings are read from environment variables (or a `.env` file) via `app/cor
 | `RATE_LIMIT_INCIDENTS_PER_MINUTE` | `100` | Not in the original spec's suggested defaults — added so this router isn't left unlimited |
 | `RATE_LIMIT_INGESTION_PER_MINUTE` | `10` | Not in the original spec's suggested defaults — ingestion triggers external HTTP calls, the platform's most abuse-prone surface |
 | `RATE_LIMIT_EVALUATION_RUNS_PER_MINUTE` | `60` | Not in the original spec's suggested defaults — covers the read-only `GET /evaluation/runs*`, `/stats` views |
+| `RATE_LIMIT_ALERTS_PER_MINUTE` | `20` | `POST /alerts/webhook` — same cost class as `/agent/investigate` (it calls the same orchestrator internally), so it shares that default |
 
 ## Authentication
 
@@ -274,7 +277,7 @@ each endpoint at `/docs`) alongside its usual success responses.
 
 ## API surface
 
-21 endpoints across 6 routers (plus FastAPI's auto-generated `/docs`, `/redoc`, `/openapi.json`).
+22 endpoints across 7 routers (plus FastAPI's auto-generated `/docs`, `/redoc`, `/openapi.json`).
 Reduced from 27 in Phase 23A by removing duplicate/legacy routes — one canonical endpoint per
 business capability; see [Phase 23A: API surface consolidation](#phase-23a-api-surface-consolidation)
 below.
@@ -297,6 +300,11 @@ and reranking over the API, despite the "debug" name.
 full planner/hypothesis/critic/orchestrator loop. (Phase 23A retired `/investigate-advanced` and
 the separate `/investigate-orchestrated` path — three routes for one business capability at three
 generations of sophistication became one.)
+
+**Alerts** (Phase 25) — `POST /alerts/webhook` — accepts a Prometheus Alertmanager or PagerDuty
+webhook payload as-is, normalizes it, and runs the exact same orchestrator `/agent/investigate`
+calls. See [Alert-triggered investigation, deployment history, and an execution policy
+engine](#alert-triggered-investigation-deployment-history-and-an-execution-policy-engine) below.
 
 **Evaluation** (12 endpoints) — `POST /evaluation/query|retrieval|reasoning|full`,
 `GET /evaluation/runs`, `/runs/latest`, `/runs/{run_id}` (now includes failed-query/
@@ -337,7 +345,7 @@ only genuine duplication.
 ## Running tests
 
 ```bash
-python -m pytest              # full suite — 1,508 tests
+python -m pytest              # full suite — 1,606 tests
 python -m pytest tests/unit    # unit tests only (no HTTP layer)
 python -m pytest tests/api     # FastAPI route tests (TestClient, no real DB/LLM)
 python -m ruff check .         # lint
@@ -348,7 +356,7 @@ Postgres or OpenAI credentials are needed. Two settings must be *present* though
 `LLMService` and Bearer auth both fail closed at construction on an empty value; CI supplies dummy
 values for `OPENAI_API_KEY` and `API_KEY`, and a local `.env` covers it otherwise.
 
-**Latest verified result: 1,508 passed, 0 failures.**
+**Latest verified result: 1,606 passed, 0 failures.**
 
 The long-standing failure in
 `tests/api/test_production_hardening.py::test_evaluation_run_id_with_dots_only_rejected` is fixed.
@@ -450,8 +458,65 @@ transient LLM failures (a single rate-limit or timeout fails the whole call). Bo
 scoped, and left for a future phase rather than bundled in here.
 
 72 new tests cover both sub-phases (48 for 24A's configuration validation, 24 for 24B's failure
-paths); combined with everything before it, the full suite is 1,508 tests (see
+paths); combined with everything before it, the full suite is 1,606 tests (see
 [Running tests](#running-tests)).
+
+## Alert-triggered investigation, deployment history, and an execution policy engine
+
+Phase 25 asks a different question than everything above: not "how good is a diagnosis" but "what
+happens once you have one." Three additions, each independently useful, wired together end to end.
+
+**`POST /alerts/webhook` accepts a monitoring provider's alert as-is.** Prometheus Alertmanager and
+PagerDuty webhook payloads have nothing in common syntactically — this normalizes either shape
+(`app/services/alert_normalization.py`, structured the same way as the ingestion layer's
+`SourceAdapter` — a common ABC, tried by `matches()`, first match wins) into a plain problem
+statement, then runs it through the *unmodified* `MultiAgentInvestigationOrchestrator`. A human
+typing the same problem into `/agent/investigate` gets an identical investigation; the webhook
+changes only where the problem statement comes from.
+
+**`DeploymentHistoryClient` answers "what deployed near this failure window."** Given a repository
+and a failure timestamp, it returns GitHub commits in an asymmetric window — wide lookback (a
+deploy precedes the failure it causes by minutes to hours), narrow lookahead (only to absorb clock
+skew). This is a correlation-in-time lookup, not a causal claim: it returns candidates for a human
+(or a future hypothesis-scoring step) to weigh, exactly the same posture `HypothesisEvaluator`
+already takes toward its own supporting evidence. Like other read-only diagnostics in this
+codebase, it fails open — a timeout or network error returns an empty list with a warning logged,
+rather than failing the investigation that requested context.
+
+**`ActionPolicyEngine` is the actual point of this phase.** Everything upstream of it produces a
+*diagnosis* — a root cause and a confidence score. None of it should be trusted to decide when an
+*action* is safe, because confidence measures how sure a model is that it found the right problem,
+not how reversible a proposed fix is. The engine classifies a proposed action into exactly two
+categories and applies exactly one rule per category: `READ_ONLY` may proceed automatically;
+`STATE_CHANGING` **always** requires human approval, with no threshold and no confidence override —
+a rollback proposed at confidence 0.99 gets the identical gate as one proposed at 0.40. An action
+type the engine has never seen fails closed to `STATE_CHANGING` rather than being assumed safe. This
+is the same deterministic, one-sentence-explainable posture as `RuleBasedPlanner` and
+`HeuristicCriticAgent` elsewhere in this codebase — and it is deliberately *not* tunable, because the
+one failure this module exists to prevent is a sufficiently confident diagnosis buying its way past
+a human.
+
+The webhook ties the three together: after an investigation returns, a small heuristic (authored by
+inspection, not validated against real incident/deployment correlation data — flagged as exactly
+that in the code) suggests `rollback_deployment` when a deployment landed in the failure window and
+confidence is HIGH, or `gather_diagnostics` otherwise. Whatever it suggests is then run through the
+policy engine, which is the part that actually matters: the suggestion can be as wrong as it likes,
+because a state-changing suggestion never executes — this project implements no execution path at
+all, on purpose. `suggested_action`/`policy_decision` are null whenever the investigation abstained,
+since there is nothing to act on.
+
+**An MCP server exposes four of these capabilities as tools** (`app/mcp/server.py`, run with
+`python -m app.mcp.server`): `investigate`, `search_incidents`, `check_action_policy`,
+`deployment_history`. Each tool is a thin adapter over an already-tested service — no new logic
+lives in the MCP layer, so a wrong answer is a bug in the underlying service, not in the adapter.
+There is deliberately no `rollback` or `restart_service` tool: giving an MCP client a tool that
+skips `check_action_policy` would defeat the reason the policy engine exists. Verified against the
+real protocol, not just as Python functions — a subprocess spawned over stdio with the actual `mcp`
+client SDK correctly lists all four tools and returns `requires_approval: true` for a
+`rollback_deployment` call made at confidence 0.99.
+
+98 new tests (policy engine, deployment history, alert normalization, the webhook route, the MCP
+adapters); combined with everything before it, the full suite is 1,606 tests.
 
 ## Evaluation findings
 
@@ -666,18 +731,22 @@ failures (both identified in the Phase 24B audit, deliberately not fixed in that
 using each hypothesis's own keywords, so it cannot surface evidence *against* a hypothesis and the
 `contradicting_evidence` field is a misnomer (see [Evaluation findings](#evaluation-findings)); the
 cross-encoder retrieval gate is measured but ships disabled, with a threshold read off its own
-calibration curve rather than fitted on a held-out split; and the Anthropic/Gemini judge clients are
+calibration curve rather than fitted on a held-out split; the Anthropic/Gemini judge clients are
 implemented and tested but not constructed by any evaluation run, so the LLM-as-judge circularity
-caveat (answers written and graded by the same model family) remains open in practice.
+caveat (answers written and graded by the same model family) remains open in practice; and Phase
+25's action-suggestion heuristic (rollback vs. gather-diagnostics) is authored by inspection, not
+validated against real incident/deployment correlation data — the policy engine that gates whatever
+it suggests is the load-bearing part, the heuristic itself is not.
 
 ## Project status
 
-**Core engineering implementation is substantially complete through Phase 24.** Ingestion, hybrid
-retrieval with adaptive routing, the four-agent investigation loop, the evaluation platform
-(retrieval/reasoning/generation/grounding metrics, LLM-as-judge, diagnostics), and two hardening
-passes (Phase 23's input validation/graceful-degradation/load-testing, Phase 24's environment
-configuration and failure-handling audit) are all implemented and covered by the current 1,508-test
-suite (all passing — see [Running tests](#running-tests)).
+**Core engineering implementation is substantially complete through Phase 25.** Ingestion, hybrid
+retrieval with adaptive routing, the four-agent investigation loop, alert-triggered investigation
+with deployment-history context and an execution policy engine, an MCP server exposing the platform
+as tools, the evaluation platform (retrieval/reasoning/generation/grounding metrics, LLM-as-judge,
+diagnostics), and two hardening passes (Phase 23's input validation/graceful-degradation/
+load-testing, Phase 24's environment configuration and failure-handling audit) are all implemented
+and covered by the current 1,606-test suite (all passing — see [Running tests](#running-tests)).
 
 Since that checkpoint, a diagnostic pass found and fixed a planner bug that made the pipeline
 confidently wrong even on perfect retrieval, and established that a local cross-encoder separates
@@ -692,11 +761,14 @@ contradicting evidence by construction, so the rule-based critic has never once 
 and the LLM critic that catches this is demonstrated on a single case rather than measured across the
 gold set; two failure-handling gaps in the investigation orchestrator (noted above) were identified
 and deliberately deferred rather than fixed; the LLM-as-judge circularity caveat is unresolved because
-no evaluation run constructs the second-model judge clients that now exist; and the platform has not
-been deployed anywhere beyond local Docker Compose — no staging/production environment, no CI
-live deployment verification. CI now runs the full suite on every push and pull request
-(`.github/workflows/ci.yml`); linting runs alongside it but is deliberately advisory rather than
-gating, because the codebase has ~418 ruff findings (mostly docstring line-length and import
+no evaluation run constructs the second-model judge clients that now exist; Phase 25's
+rollback-vs-diagnostics suggestion is a hand-authored heuristic, not something measured against real
+deployment/incident correlation, and this project implements no execution path for any action —
+policy decisions are recommendations, nothing actually rolls back or restarts anything; and the
+platform has not been deployed anywhere beyond local Docker Compose — no staging/production
+environment, no live deployment verification. CI now runs the full suite on every push and pull
+request (`.github/workflows/ci.yml`); linting runs alongside it but is deliberately advisory rather
+than gating, because the codebase has ~418 ruff findings (mostly docstring line-length and import
 ordering, none behavioural) and a permanently red build trains people to ignore CI.
 
 The work is intentionally paused here, before deployment, specifically to keep an accurate and
